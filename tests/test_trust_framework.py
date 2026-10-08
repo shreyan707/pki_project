@@ -12,6 +12,7 @@ import unittest
 import copy
 import numpy as np
 from typing import Optional, Tuple, Dict, List
+from cryptography.hazmat.primitives import serialization
 from src.layer1_identity import PeerIdentity, P2PCertificate, PeerState
 from src.layer2_mesh_pki import MeshPKINetwork, CrossCertificate
 from src.layer3_eigentrust import (
@@ -20,7 +21,14 @@ from src.layer3_eigentrust import (
     ContentManifest, ContentRequest, ChunkResponse, FaultEvidenceRecord,
     LocalEvidenceJournal, SimulatorCanonicalJournal, JournalEntry
 )
-from src.layer4_recovery import CertificateRevocationRecord, ShamirSecretSharing
+from src.layer4_recovery import (
+    CertificateRevocationRecord, ShamirSecretSharing,
+    RevocationProposal, LocalRevocationStore, RevocationCoordinator,
+    evict_peer_from_mesh, process_incoming_crr,
+    RecoveryAuthorizationToken, RecoveryRequest, KeyRecoveryCoordinator,
+    KeyRotationCertificate, rotate_key_after_recovery, is_key_valid_for_operations,
+    PRIME
+)
 
 
 class TestPKITrustFramework(unittest.TestCase):
@@ -1101,6 +1109,448 @@ class TestPKITrustFramework(unittest.TestCase):
         subset_2 = [shares[0], shares[1]]
         recovered_wrong = ShamirSecretSharing.reconstruct_secret(subset_2)
         self.assertNotEqual(recovered_wrong, secret)
+
+    # =========================================================================
+    # PHASE 4 TESTS: LAYER 4 (CRR, QUORUM, STATE MACHINE, RECOVERY, ROTATION)
+    # =========================================================================
+
+    def test_phase4_a_crr_serialization_and_verification(self):
+        """Tests CRR canonical serialization, Ed25519 signatures, and field tampering rejection."""
+        sn1 = PeerIdentity("Supernode_1", difficulty_bits=8)
+        accused = PeerIdentity("AccusedServer", difficulty_bits=8)
+
+        crr = CertificateRevocationRecord(
+            revocation_id="crr-test-001",
+            revoked_did=accused.did,
+            revoked_pubkey_hex=accused.public_key_hex,
+            reason="ATTRIBUTABLE_INCONSISTENT_DELIVERY",
+            evidence_id="ev-fault-001",
+            timestamp=1000.0,
+            supernode_signatures={}
+        )
+        self.assertTrue(crr.payload_bytes().startswith(b"PKI_V2_CRR:"))
+        expected_payload = f"PKI_V2_CRR:{crr.revocation_id}:{crr.revoked_did}:{crr.revoked_pubkey_hex}:{crr.reason}:{crr.evidence_id}:{crr.timestamp}".encode("utf-8")
+        self.assertEqual(crr.payload_bytes(), expected_payload)
+
+        # Valid signature
+        sig = sn1.sign(crr.payload_bytes()).hex()
+        crr.supernode_signatures[sn1.did] = sig
+        supernodes = {sn1.did: sn1.public_key_hex}
+        self.assertTrue(crr.is_quorum_approved(supernodes, threshold_m=1))
+
+        # Tampered reason rejected
+        tampered_reason = copy.deepcopy(crr)
+        tampered_reason.reason = "FORGED_REASON"
+        self.assertFalse(tampered_reason.is_quorum_approved(supernodes, threshold_m=1))
+
+        # Tampered revoked DID rejected
+        tampered_did = copy.deepcopy(crr)
+        tampered_did.revoked_did = "did:peer:2.Ez" + "0" * 64
+        self.assertFalse(tampered_did.is_quorum_approved(supernodes, threshold_m=1))
+
+        # Tampered timestamp rejected
+        tampered_ts = copy.deepcopy(crr)
+        tampered_ts.timestamp = 2000.0
+        self.assertFalse(tampered_ts.is_quorum_approved(supernodes, threshold_m=1))
+
+    def test_phase4_b_quorum_authorization(self):
+        """Tests configurable quorum (1-of-1, 3-of-5), duplicate signers, ineligible signers, and signature verification."""
+        sns = [PeerIdentity(f"SN_{i}", difficulty_bits=8) for i in range(5)]
+        supernode_pubkeys = {sn.did: sn.public_key_hex for sn in sns}
+        accused = PeerIdentity("AccusedPeer", difficulty_bits=8)
+
+        crr = CertificateRevocationRecord(
+            revocation_id="crr-quorum-001",
+            revoked_did=accused.did,
+            revoked_pubkey_hex=accused.public_key_hex,
+            reason="ATTRIBUTABLE_INCONSISTENT_DELIVERY",
+            evidence_id="ev-fault-quorum",
+            timestamp=1000.0,
+            supernode_signatures={}
+        )
+        payload = crr.payload_bytes()
+
+        # 1-of-1 quorum
+        crr.supernode_signatures[sns[0].did] = sns[0].sign(payload).hex()
+        self.assertTrue(crr.is_quorum_approved(supernode_pubkeys, threshold_m=1))
+        # 1-of-1 fails threshold 2
+        self.assertFalse(crr.is_quorum_approved(supernode_pubkeys, threshold_m=2))
+
+        # Add second and third signatures for 3-of-5
+        crr.supernode_signatures[sns[1].did] = sns[1].sign(payload).hex()
+        crr.supernode_signatures[sns[2].did] = sns[2].sign(payload).hex()
+        self.assertTrue(crr.is_quorum_approved(supernode_pubkeys, threshold_m=3))
+        self.assertFalse(crr.is_quorum_approved(supernode_pubkeys, threshold_m=4))
+
+        # Ineligible signer does not count
+        stranger = PeerIdentity("Stranger", difficulty_bits=8)
+        crr_ineligible = copy.deepcopy(crr)
+        crr_ineligible.supernode_signatures = {
+            sns[0].did: sns[0].sign(payload).hex(),
+            sns[1].did: sns[1].sign(payload).hex(),
+            stranger.did: stranger.sign(payload).hex()
+        }
+        # Only 2 eligible signers, threshold 3 must fail
+        self.assertFalse(crr_ineligible.is_quorum_approved(supernode_pubkeys, threshold_m=3))
+
+        # Invalid signature excluded
+        crr_bad_sig = copy.deepcopy(crr)
+        crr_bad_sig.supernode_signatures[sns[2].did] = "00" * 64
+        self.assertFalse(crr_bad_sig.is_quorum_approved(supernode_pubkeys, threshold_m=3))
+
+    def test_phase4_c_state_machine_transitions(self):
+        """Tests exact frozen state machine transitions and forbidden transition enforcement."""
+        sns = [PeerIdentity(f"SN_{i}", difficulty_bits=8) for i in range(3)]
+        supernode_pubkeys = {sn.did: sn.public_key_hex for sn in sns}
+        coord = RevocationCoordinator(supernode_pubkeys=supernode_pubkeys, threshold_m=2, voting_timeout=600.0, subjective_suspicion_timeout=300.0)
+
+        accused = PeerIdentity("AccusedNode", difficulty_bits=8)
+        coord.set_peer_state(accused.did, PeerState.ACTIVE)
+
+        # 1. ACTIVE -> SUSPECTED (Certified Fault)
+        self.assertTrue(coord.record_suspicion(accused.did, is_certified=True, timestamp=100.0))
+        self.assertEqual(coord.get_peer_state(accused.did), PeerState.SUSPECTED)
+
+        # Certified suspicion NEVER expires to ACTIVE
+        self.assertFalse(coord.check_suspicion_expiry(accused.did, current_time=10000.0))
+        self.assertEqual(coord.get_peer_state(accused.did), PeerState.SUSPECTED)
+
+        # Subjective suspicion CAN expire to ACTIVE
+        sub_peer = PeerIdentity("SubjectivePeer", difficulty_bits=8)
+        coord.set_peer_state(sub_peer.did, PeerState.ACTIVE)
+        coord.record_suspicion(sub_peer.did, is_certified=False, timestamp=100.0)
+        self.assertEqual(coord.get_peer_state(sub_peer.did), PeerState.SUSPECTED)
+        self.assertTrue(coord.check_suspicion_expiry(sub_peer.did, current_time=500.0))
+        self.assertEqual(coord.get_peer_state(sub_peer.did), PeerState.ACTIVE)
+
+        # 2. Cannot skip SUSPECTED to reach REVOCATION_PROPOSED
+        fresh_peer = PeerIdentity("FreshPeer", difficulty_bits=8)
+        coord.set_peer_state(fresh_peer.did, PeerState.ACTIVE)
+        reporter = PeerIdentity("Reporter", difficulty_bits=8)
+        ev, _, _, _ = self._create_signed_fault_evidence(reporter, fresh_peer, reporter)
+        illegal_prop = RevocationProposal(
+            proposal_id="prop-illegal",
+            reporter_did=reporter.did,
+            accused_did=fresh_peer.did,
+            evidence=ev,
+            timestamp=100.0
+        )
+        self.assertFalse(coord.submit_proposal(illegal_prop))
+        self.assertEqual(coord.get_peer_state(fresh_peer.did), PeerState.ACTIVE)
+
+        # 3. SUSPECTED -> REVOCATION_PROPOSED upon valid proposal
+        ev_accused, _, _, _ = self._create_signed_fault_evidence(reporter, accused, reporter)
+        prop = RevocationProposal(
+            proposal_id="prop-001",
+            reporter_did=reporter.did,
+            accused_did=accused.did,
+            evidence=ev_accused,
+            timestamp=100.0,
+            timeout=600.0
+        )
+        prop.reporter_sig_hex = reporter.sign(prop.payload_bytes()).hex()
+        self.assertTrue(coord.submit_proposal(prop))
+        self.assertEqual(coord.get_peer_state(accused.did), PeerState.REVOCATION_PROPOSED)
+
+        # 4. Quorum timeout fallback: REVOCATION_PROPOSED -> SUSPECTED (NEVER ACTIVE)
+        self.assertTrue(coord.check_proposal_timeout("prop-001", current_time=800.0))
+        self.assertEqual(coord.get_peer_state(accused.did), PeerState.SUSPECTED)
+
+        # 5. Re-propose and achieve Quorum: REVOCATION_PROPOSED -> REVOKED
+        prop2 = RevocationProposal(
+            proposal_id="prop-002",
+            reporter_did=reporter.did,
+            accused_did=accused.did,
+            evidence=ev_accused,
+            timestamp=1000.0,
+            timeout=600.0
+        )
+        prop2.reporter_sig_hex = reporter.sign(prop2.payload_bytes()).hex()
+        self.assertTrue(coord.submit_proposal(prop2))
+        self.assertEqual(coord.get_peer_state(accused.did), PeerState.REVOCATION_PROPOSED)
+
+        # Cast supernode votes
+        draft_crr = CertificateRevocationRecord(
+            revocation_id="crr-prop-002",
+            revoked_did=accused.did,
+            revoked_pubkey_hex=accused.public_key_hex,
+            reason="ATTRIBUTABLE_INCONSISTENT_DELIVERY",
+            evidence_id=prop2.evidence_id,
+            timestamp=prop2.timestamp
+        )
+        crr_payload = draft_crr.payload_bytes()
+        sig_sn0 = sns[0].sign(crr_payload).hex()
+        sig_sn1 = sns[1].sign(crr_payload).hex()
+
+        ok, crr_out = coord.cast_vote("prop-002", sns[0].did, sig_sn0)
+        self.assertTrue(ok)
+        self.assertIsNone(crr_out)  # 1 vote, threshold 2 not reached
+        self.assertEqual(coord.get_peer_state(accused.did), PeerState.REVOCATION_PROPOSED)
+
+        ok, final_crr = coord.cast_vote("prop-002", sns[1].did, sig_sn1)
+        self.assertTrue(ok)
+        self.assertIsNotNone(final_crr)
+        self.assertEqual(coord.get_peer_state(accused.did), PeerState.REVOKED)
+
+        # 6. Forbidden transition enforcement
+        with self.assertRaises(ValueError):
+            coord.validate_transition(PeerState.REVOCATION_PROPOSED, PeerState.ACTIVE)
+        with self.assertRaises(ValueError):
+            coord.validate_transition(PeerState.SUSPECTED, PeerState.ACTIVE, is_certified=True)
+        with self.assertRaises(ValueError):
+            coord.validate_transition(PeerState.ACTIVE, PeerState.REVOCATION_PROPOSED)
+        with self.assertRaises(ValueError):
+            coord.validate_transition(PeerState.REVOKED, PeerState.ACTIVE)
+
+    def test_phase4_d_revocation_store(self):
+        """Tests LocalRevocationStore storing valid CRRs, duplicate rejection, and lookup."""
+        store = LocalRevocationStore()
+        sn = PeerIdentity("SN_Store", difficulty_bits=8)
+        accused = PeerIdentity("AccusedStore", difficulty_bits=8)
+
+        crr = CertificateRevocationRecord(
+            revocation_id="crr-store-001",
+            revoked_did=accused.did,
+            revoked_pubkey_hex=accused.public_key_hex,
+            reason="ATTRIBUTABLE_INCONSISTENT_DELIVERY",
+            evidence_id="ev-store-001",
+            timestamp=1000.0,
+            supernode_signatures={}
+        )
+        crr.supernode_signatures[sn.did] = sn.sign(crr.payload_bytes()).hex()
+        sns = {sn.did: sn.public_key_hex}
+
+        # Valid store
+        self.assertFalse(store.is_revoked(accused.did))
+        self.assertTrue(store.store_crr(crr, sns, threshold_m=1))
+        self.assertTrue(store.is_revoked(accused.did))
+        self.assertEqual(store.get_crr(accused.did), crr)
+        self.assertEqual(store.get_by_revocation_id("crr-store-001"), crr)
+
+        # Duplicate CRR rejection
+        self.assertFalse(store.store_crr(crr, sns, threshold_m=1))
+
+    def test_phase4_e_peer_eviction(self):
+        """Tests peer eviction from MeshPKINetwork, link severance, and re-admission prevention."""
+        mesh = MeshPKINetwork(max_hops=4)
+        node_a = PeerIdentity("NodeA", difficulty_bits=12)
+        node_b = PeerIdentity("NodeB", difficulty_bits=12)
+        rogue = PeerIdentity("RoguePeer", difficulty_bits=12)
+
+        self.assertTrue(mesh.register_peer(node_a))
+        self.assertTrue(mesh.register_peer(node_b))
+        self.assertTrue(mesh.register_peer(rogue))
+
+        mesh.issue_cross_certificate(node_a, rogue, 0.9)
+        mesh.issue_cross_certificate(rogue, node_b, 0.9)
+
+        sn = PeerIdentity("SN_Evict", difficulty_bits=8)
+        crr = CertificateRevocationRecord(
+            revocation_id="crr-evict-001",
+            revoked_did=rogue.did,
+            revoked_pubkey_hex=rogue.public_key_hex,
+            reason="ATTRIBUTABLE_INCONSISTENT_DELIVERY",
+            evidence_id="ev-evict-001",
+            timestamp=1000.0,
+            supernode_signatures={}
+        )
+        crr.supernode_signatures[sn.did] = sn.sign(crr.payload_bytes()).hex()
+        sns = {sn.did: sn.public_key_hex}
+
+        # Invalid CRR cannot evict
+        tampered_crr = copy.deepcopy(crr)
+        tampered_crr.reason = "BAD_REASON"
+        self.assertFalse(evict_peer_from_mesh(mesh, tampered_crr, sns, threshold_m=1))
+        self.assertIn(rogue.did, mesh.peers)
+
+        # Valid CRR executes eviction
+        self.assertTrue(evict_peer_from_mesh(mesh, crr, sns, threshold_m=1))
+        self.assertNotIn(rogue.did, mesh.peers)
+        self.assertEqual(rogue.state, PeerState.REVOKED)
+        self.assertNotIn(rogue.did, mesh.trust_graph)
+
+        # Rogue cannot be re-admitted using revoked identity
+        self.assertFalse(mesh.register_peer(rogue))
+
+    def test_phase4_f_crr_propagation_handling(self):
+        """Tests processing incoming CRRs from gossip propagation."""
+        store = LocalRevocationStore()
+        sn = PeerIdentity("SN_Prop", difficulty_bits=8)
+        accused = PeerIdentity("AccusedProp", difficulty_bits=8)
+        sns = {sn.did: sn.public_key_hex}
+
+        now = time.time()
+        crr = CertificateRevocationRecord(
+            revocation_id="crr-prop-001",
+            revoked_did=accused.did,
+            revoked_pubkey_hex=accused.public_key_hex,
+            reason="ATTRIBUTABLE_INCONSISTENT_DELIVERY",
+            evidence_id="ev-prop-001",
+            timestamp=now,
+            supernode_signatures={}
+        )
+        crr.supernode_signatures[sn.did] = sn.sign(crr.payload_bytes()).hex()
+
+        # Valid incoming CRR accepted
+        self.assertTrue(process_incoming_crr(crr, sns, threshold_m=1, store=store, current_time=now))
+        self.assertTrue(store.is_revoked(accused.did))
+
+        # Tampered CRR rejected
+        bad_crr = copy.deepcopy(crr)
+        bad_crr.supernode_signatures[sn.did] = "00" * 64
+        self.assertFalse(process_incoming_crr(bad_crr, sns, threshold_m=1, store=store, current_time=now))
+
+        # Stale CRR rejected
+        stale_crr = copy.deepcopy(crr)
+        stale_crr.timestamp = now - 500.0
+        stale_crr.supernode_signatures[sn.did] = sn.sign(stale_crr.payload_bytes()).hex()
+        self.assertFalse(process_incoming_crr(stale_crr, sns, threshold_m=1, store=store, current_time=now))
+
+    def test_phase4_g_recovery_authorization(self):
+        """Tests KeyRecoveryCoordinator separation of authentication, authorization, and replay protection."""
+        subject = PeerIdentity("SubjectPeer", difficulty_bits=8)
+        guardian = PeerIdentity("GuardianNode", difficulty_bits=8)
+        custodian = PeerIdentity("Custodian1", difficulty_bits=8)
+        requester = PeerIdentity("RequesterAgent", difficulty_bits=8)
+
+        now = time.time()
+        token = RecoveryAuthorizationToken(
+            token_id="tok-recov-001",
+            subject_did=subject.did,
+            requester_pubkey_hex=requester.public_key_hex,
+            custodian_did=custodian.did,
+            timestamp=now,
+            expiry=now + 600.0,
+            authorization_scope="KEY_RECOVERY"
+        )
+        token.guardian_signature_hex = guardian.sign(token.payload_bytes()).hex()
+
+        req = RecoveryRequest(
+            request_id="req-recov-001",
+            subject_did=subject.did,
+            requester_pubkey_hex=requester.public_key_hex,
+            timestamp=now,
+            auth_token=token
+        )
+        req.requester_sig_hex = requester.sign(req.payload_bytes()).hex()
+
+        coord = KeyRecoveryCoordinator(guardian_pubkey_hex=guardian.public_key_hex)
+        share = (1, 88888888)
+
+        # Valid release
+        released = coord.authorize_share_release(req, custodian.did, share, current_time=now)
+        self.assertEqual(released, share)
+
+        # Request replay rejected
+        with self.assertRaises(ValueError):
+            coord.authorize_share_release(req, custodian.did, share, current_time=now)
+
+        # Unauthenticated request rejected (bad requester signature)
+        req2 = RecoveryRequest(
+            request_id="req-recov-002",
+            subject_did=subject.did,
+            requester_pubkey_hex=requester.public_key_hex,
+            timestamp=now,
+            auth_token=token,
+            requester_sig_hex="00" * 64
+        )
+        with self.assertRaises(PermissionError):
+            coord.authorize_share_release(req2, custodian.did, share, current_time=now)
+
+        # Unauthorized token rejected (forged guardian signature)
+        bad_token = copy.deepcopy(token)
+        bad_token.token_id = "tok-forged"
+        bad_token.guardian_signature_hex = "ff" * 64
+        req3 = RecoveryRequest(
+            request_id="req-recov-003",
+            subject_did=subject.did,
+            requester_pubkey_hex=requester.public_key_hex,
+            timestamp=now,
+            auth_token=bad_token
+        )
+        req3.requester_sig_hex = requester.sign(req3.payload_bytes()).hex()
+        with self.assertRaises(PermissionError):
+            coord.authorize_share_release(req3, custodian.did, share, current_time=now)
+
+    def test_phase4_h_shamir_threshold_recovery(self):
+        """Tests authorized Shamir secret recovery, threshold enforcement, and malformed share handling."""
+        secret = 987654321012345678909876543210
+        shares = ShamirSecretSharing.split_secret(secret, k_threshold=3, n_shares=5)
+
+        guardian = PeerIdentity("GuardianShamir", difficulty_bits=8)
+        coord = KeyRecoveryCoordinator(guardian_pubkey_hex=guardian.public_key_hex)
+
+        now = time.time()
+        token = RecoveryAuthorizationToken(
+            token_id="tok-shamir-001",
+            subject_did="did:peer:2.EzSubject",
+            requester_pubkey_hex="a" * 64,
+            custodian_did="did:peer:2.EzCustodian",
+            timestamp=now,
+            expiry=now + 600.0
+        )
+        token.guardian_signature_hex = guardian.sign(token.payload_bytes()).hex()
+
+        # Threshold reconstruction succeeds
+        recovered = coord.reconstruct_secret_with_authorization(shares[:3], token, threshold_k=3, current_time=now)
+        self.assertEqual(recovered, secret)
+
+        # Token replay rejected
+        with self.assertRaises(ValueError):
+            coord.reconstruct_secret_with_authorization(shares[:3], token, threshold_k=3, current_time=now)
+
+        # Insufficient shares fail
+        token2 = copy.deepcopy(token)
+        token2.token_id = "tok-shamir-002"
+        token2.guardian_signature_hex = guardian.sign(token2.payload_bytes()).hex()
+        with self.assertRaises(ValueError):
+            coord.reconstruct_secret_with_authorization(shares[:2], token2, threshold_k=3, current_time=now)
+
+        # Malformed shares fail safely
+        token3 = copy.deepcopy(token)
+        token3.token_id = "tok-shamir-003"
+        token3.guardian_signature_hex = guardian.sign(token3.payload_bytes()).hex()
+        with self.assertRaises(ValueError):
+            coord.reconstruct_secret_with_authorization([(1, "corrupted_share"), shares[1], shares[2]], token3, threshold_k=3, current_time=now)
+
+        # Arbitrary shares without valid AuthTok fail
+        token_unauth = copy.deepcopy(token)
+        token_unauth.token_id = "tok-unauth"
+        token_unauth.guardian_signature_hex = "00" * 64
+        with self.assertRaises(PermissionError):
+            coord.reconstruct_secret_with_authorization(shares[:3], token_unauth, threshold_k=3, current_time=now)
+
+    def test_phase4_i_key_rotation_and_invalidation(self):
+        """Tests post-recovery key rotation, dual-signature rotation certificate, and old key invalidation."""
+        alice = PeerIdentity("AliceOriginal", difficulty_bits=8)
+        alice_secret_int = int.from_bytes(
+            alice.private_key.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption()
+            ),
+            byteorder="big"
+        )
+
+        new_alice, rot_cert = rotate_key_after_recovery(alice, alice_secret_int, "AliceRotated")
+
+        # New key is cryptographically distinct
+        self.assertNotEqual(new_alice.public_key_hex, alice.public_key_hex)
+        self.assertNotEqual(new_alice.did, alice.did)
+
+        # Rotation certificate properties
+        self.assertTrue(rot_cert.payload_bytes().startswith(b"PKI_V2_ROTATE:"))
+        self.assertEqual(rot_cert.old_did, alice.did)
+        self.assertEqual(rot_cert.new_did, new_alice.did)
+        self.assertTrue(rot_cert.verify(alice.public_key_hex))
+
+        # Operational status: new key active, old key retired
+        self.assertTrue(is_key_valid_for_operations(new_alice))
+        self.assertFalse(is_key_valid_for_operations(alice))
+
+        # Rotation with incorrect secret rejected
+        with self.assertRaises(ValueError):
+            rotate_key_after_recovery(new_alice, 11111111)
 
 
 if __name__ == '__main__':
