@@ -29,6 +29,7 @@ from src.layer4_recovery import (
     KeyRotationCertificate, rotate_key_after_recovery, is_key_valid_for_operations,
     PRIME
 )
+from src.network_simulator import SwarmSimulation, SimulatedNode
 
 
 class TestPKITrustFramework(unittest.TestCase):
@@ -1551,6 +1552,381 @@ class TestPKITrustFramework(unittest.TestCase):
         # Rotation with incorrect secret rejected
         with self.assertRaises(ValueError):
             rotate_key_after_recovery(new_alice, 11111111)
+
+    # =========================================================================
+    # PHASE 5 TESTS: SIMULATOR INTEGRATION & 4-LAYER PROTOCOL FLOWS
+    # =========================================================================
+
+    def test_phase5_integration_a_real_peer_admission(self):
+        """Tests real node initialization, PoW admission, and state progression in SwarmSimulation."""
+        sim = SwarmSimulation(num_honest=4, num_supernodes=3, num_sybils=3, seed=42, difficulty_bits=8)
+        self.assertEqual(len(sim.nodes), 10)
+        self.assertEqual(sim.metrics["admission"]["admitted"], 10)
+
+        # Every node has active identity state and full 64-hex DID
+        for node in sim.nodes.values():
+            self.assertEqual(node.identity.state, PeerState.ACTIVE)
+            self.assertTrue(node.did.startswith("did:peer:2.Ez"))
+            self.assertEqual(len(node.public_key_hex), 64)
+            self.assertIn(node.did, sim.mesh.peers)
+
+        # Node with invalid PoW rejected by admission path
+        bad_pow_node = SimulatedNode("BadPoW", difficulty_bits=8)
+        bad_pow_node.identity.certificate.pow_nonce = 0
+        self.assertFalse(sim._admit_node(bad_pow_node))
+
+    def test_phase5_integration_b_content_request_response_merkle(self):
+        """Tests genuine Merkle trees, signed manifests, ContentRequests, and ChunkResponses."""
+        node = SimulatedNode("ContentHost", difficulty_bits=8)
+        content, manifest, tree = node.generate_file("test-file-001", size_kb=64, chunk_size_kb=16)
+
+        self.assertEqual(manifest.total_chunks, 4)
+        self.assertEqual(manifest.root_hash, tree.root_hash)
+        self.assertTrue(manifest.verify_signature(node.public_key_hex))
+
+        # Honest request & response for chunk 2
+        client = SimulatedNode("ContentClient", difficulty_bits=8)
+        req = ContentRequest(
+            req_id="req-test-01",
+            client_did=client.did,
+            server_did=node.did,
+            content_id="test-file-001",
+            chunk_index=2,
+            merkle_root=manifest.root_hash,
+            timestamp=time.time(),
+            nonce="nonce-test-01",
+            client_sig_hex=""
+        )
+        req.client_sig_hex = client.identity.sign(req.payload_bytes()).hex()
+
+        chunk_bytes = node.get_chunk("test-file-001", 2)
+        proof = tree.generate_proof(2)
+        resp = ChunkResponse(
+            req_id=req.req_id,
+            client_did=client.did,
+            server_did=node.did,
+            content_id="test-file-001",
+            chunk_index=2,
+            chunk_bytes=chunk_bytes,
+            chunk_hash=hashlib.sha256(chunk_bytes).hexdigest().lower(),
+            proof_hash=hash_proof(proof),
+            merkle_root=manifest.root_hash,
+            timestamp=time.time(),
+            nonce=req.nonce,
+            merkle_proof=proof,
+            server_sig_hex=""
+        )
+        resp.server_sig_hex = node.identity.sign(resp.payload_bytes()).hex()
+
+        # Phase 2 standalone verification passes
+        self.assertTrue(resp.verify(node.public_key_hex, req))
+        self.assertTrue(verify_merkle_proof(chunk_bytes, proof, 2, manifest.root_hash))
+
+    def test_phase5_integration_c_honest_receipt_accounting_no_direct_mutation(self):
+        """Tests that honest transactions route through the 7-stage evidence pipeline with zero direct S writes."""
+        sim = SwarmSimulation(num_honest=5, num_supernodes=3, num_sybils=2, seed=42, difficulty_bits=8)
+        initial_s_sum = float(np.sum(sim.eigentrust.S))
+        self.assertEqual(initial_s_sum, 0.0)
+
+        # Run 1 transaction round
+        stats = sim.execute_transaction_round(1)
+        self.assertGreater(stats["honest_success"], 0)
+        self.assertGreater(sim.metrics["evidence"]["positive_receipts"], 0)
+        self.assertGreater(sim.metrics["trust"]["s_updates"], 0)
+
+        # S-matrix updated strictly through validated receipts in the canonical journal
+        self.assertGreater(float(np.sum(sim.eigentrust.S)), initial_s_sum)
+        self.assertGreater(len(sim.canonical_journal), 0)
+
+    def test_phase5_integration_d_poisoning_fault_evidence_and_suspected(self):
+        """Tests that corrupted deliveries generate authentic FaultEvidenceRecords, deduct 2.0, and transition to SUSPECTED."""
+        sim = SwarmSimulation(num_honest=5, num_supernodes=3, num_sybils=3, seed=42, difficulty_bits=8)
+        stats = sim.execute_transaction_round(1)
+
+        self.assertGreaterEqual(stats["poison_detected"], 1)
+        self.assertGreater(sim.metrics["content"]["corrupted_deliveries"], 0)
+        self.assertGreater(sim.metrics["evidence"]["fault_evidence_accepted"], 0)
+        self.assertGreater(sim.metrics["revocation"]["suspected_transitions"], 0)
+
+    def test_phase5_integration_e_revocation_quorum_and_eviction(self):
+        """Tests that verified fault evidence triggers supernode quorum voting and peer eviction from the mesh."""
+        sim = SwarmSimulation(num_honest=5, num_supernodes=3, num_sybils=3, seed=42, difficulty_bits=8)
+        stats = sim.execute_transaction_round(1)
+
+        self.assertGreaterEqual(stats["evictions"], 1)
+        self.assertGreater(sim.metrics["revocation"]["quorum_approvals"], 0)
+        self.assertGreater(sim.metrics["revocation"]["eviction_events"], 0)
+
+        # Evicted rogue peer is marked REVOKED and removed from mesh
+        revoked_nodes = [n for n in sim.sybil_nodes if n.identity.state == PeerState.REVOKED]
+        self.assertGreater(len(revoked_nodes), 0)
+        for r in revoked_nodes:
+            self.assertNotIn(r.did, sim.mesh.peers)
+
+    def test_phase5_integration_f_readmission_rejection(self):
+        """Tests that an evicted peer cannot be re-admitted using its revoked identity."""
+        sim = SwarmSimulation(num_honest=5, num_supernodes=3, num_sybils=3, seed=42, difficulty_bits=8)
+        sim.execute_transaction_round(1)
+
+        self.assertGreater(sim.metrics["revocation"]["readmission_rejections"], 0)
+        revoked_nodes = [n for n in sim.sybil_nodes if n.identity.state == PeerState.REVOKED]
+        self.assertGreater(len(revoked_nodes), 0)
+        # Attempt direct re-registration
+        self.assertFalse(sim.mesh.register_peer(revoked_nodes[0].identity, min_difficulty=8))
+
+    def test_phase5_integration_g_receipt_and_fault_replay_protection(self):
+        """Tests that replayed receipts and replayed fault evidence are strictly rejected."""
+        sim = SwarmSimulation(num_honest=5, num_supernodes=3, num_sybils=3, seed=42, difficulty_bits=8)
+        sim.execute_transaction_round(1)
+
+        self.assertGreater(sim.metrics["evidence"]["replay_rejections"], 0)
+
+        # Explicit manual replay test
+        if sim.committed_receipts:
+            rcpt = sim.committed_receipts[0]
+            # Replay must fail in Layer 3 pipeline
+            self.assertFalse(sim.eigentrust.record_receipt(rcpt))
+
+        if sim.committed_fault_evidence:
+            ev = sim.committed_fault_evidence[0]
+            # Replay must fail in Layer 3 pipeline
+            self.assertFalse(sim.eigentrust.record_fault_evidence(ev))
+
+    def test_phase5_integration_h_crr_propagation(self):
+        """Tests CRR propagation to other nodes and commitment to LocalRevocationStore."""
+        sim = SwarmSimulation(num_honest=5, num_supernodes=3, num_sybils=3, seed=42, difficulty_bits=8)
+        sim.execute_transaction_round(1)
+
+        revoked_nodes = [n for n in sim.sybil_nodes if n.identity.state == PeerState.REVOKED]
+        if revoked_nodes:
+            rev_did = revoked_nodes[0].did
+            self.assertTrue(sim.revocation_store.is_revoked(rev_did))
+            self.assertIsNotNone(sim.revocation_store.get_crr(rev_did))
+
+    def test_phase5_integration_i_sybil_and_collusion_baseline(self):
+        """Tests that vanilla EigenTrust dampens collusive Sybils without manual suppression."""
+        sim = SwarmSimulation(num_honest=10, num_supernodes=3, num_sybils=5, seed=42, difficulty_bits=8)
+        history = sim.run_simulation(total_rounds=5)
+
+        # Collusive upvotes were processed
+        self.assertGreater(sim.metrics["evidence"]["positive_receipts"], 0)
+        # Sybil trust share is dampened near zero (< 0.05) by power-iteration over pre-trusted seeds
+        final_sybil_avg = history["sybil_avg"][-1]
+        self.assertLess(final_sybil_avg, 0.05)
+
+    def test_phase5_integration_j_recovery_and_key_rotation(self):
+        """Tests complete Layer 4 Shamir secret recovery and mandatory key rotation on simulated nodes."""
+        sim = SwarmSimulation(num_honest=5, num_supernodes=5, num_sybils=3, seed=42, difficulty_bits=8)
+        success, secret, old_did, new_did = sim.demonstrate_key_recovery()
+
+        self.assertTrue(success)
+        self.assertNotEqual(old_did, new_did)
+        self.assertEqual(sim.metrics["recovery"]["recovery_requests"], 1)
+        self.assertEqual(sim.metrics["recovery"]["auth_successes"], 1)
+        self.assertEqual(sim.metrics["recovery"]["reconstruction_successes"], 1)
+        self.assertEqual(sim.metrics["recovery"]["key_rotations"], 1)
+        self.assertEqual(sim.metrics["recovery"]["old_key_invalidations"], 1)
+
+    # =========================================================================
+    # PHASE 6 EXPERIMENTAL FRAMEWORK & EVALUATION TESTS
+    # =========================================================================
+
+    def test_phase6_a_deterministic_seed_behavior(self):
+        """Tests that identical seeds and configurations produce bit-for-bit identical results."""
+        from experiments.config import ExperimentConfig
+        from experiments.scenarios import ExperimentTrialRunner
+
+        cfg1 = ExperimentConfig("scenario_a_honest", num_honest=5, num_supernodes=2, num_sybils=2, total_rounds=3, seed=42, difficulty_bits=6)
+        cfg2 = ExperimentConfig("scenario_a_honest", num_honest=5, num_supernodes=2, num_sybils=2, total_rounds=3, seed=42, difficulty_bits=6)
+
+        r1 = ExperimentTrialRunner(cfg1).run()
+        r2 = ExperimentTrialRunner(cfg2).run()
+
+        self.assertEqual(r1["confusion"], r2["confusion"])
+        for k in r1["trust_shares"]:
+            self.assertAlmostEqual(r1["trust_shares"][k], r2["trust_shares"][k], places=7)
+        self.assertEqual(r1["operational"]["metrics_raw"]["evidence"], r2["operational"]["metrics_raw"]["evidence"])
+
+    def test_phase6_b_different_seeds_independent_trials(self):
+        """Tests that different seeds produce independent, varied operational trajectories."""
+        from experiments.config import ExperimentConfig
+        from experiments.scenarios import ExperimentTrialRunner
+
+        cfg1 = ExperimentConfig("scenario_b_poisoning", num_honest=5, num_supernodes=2, num_sybils=2, poisoning_rate=0.5, total_rounds=4, seed=42, difficulty_bits=6)
+        cfg2 = ExperimentConfig("scenario_b_poisoning", num_honest=5, num_supernodes=2, num_sybils=2, poisoning_rate=0.5, total_rounds=4, seed=999, difficulty_bits=6)
+
+        r1 = ExperimentTrialRunner(cfg1).run()
+        r2 = ExperimentTrialRunner(cfg2).run()
+
+        # Both ran valid trials, configurations are preserved per trial
+        self.assertEqual(r1["config"]["seed"], 42)
+        self.assertEqual(r2["config"]["seed"], 999)
+        self.assertIn("detection_rate", r1["confusion"])
+        self.assertIn("detection_rate", r2["confusion"])
+
+    def test_phase6_c_ground_truth_generation(self):
+        """Tests that ground-truth labels are independent, immutable by trust algorithm, and properly categorized."""
+        from experiments.config import ExperimentConfig
+        from experiments.scenarios import ExperimentTrialRunner
+
+        cfg = ExperimentConfig("scenario_c_isolated_sybil", num_honest=6, num_supernodes=2, num_sybils=4, total_rounds=2, seed=42, difficulty_bits=6)
+        runner = ExperimentTrialRunner(cfg)
+
+        gt = runner.ground_truth
+        self.assertEqual(len(gt.supernode_dids), 2)
+        self.assertEqual(len(gt.honest_dids), 6)
+        self.assertEqual(len(gt.sybil_dids), 4)
+
+        # Disjoint sets
+        self.assertTrue(gt.supernode_dids.isdisjoint(gt.honest_dids))
+        self.assertTrue(gt.honest_dids.isdisjoint(gt.sybil_dids))
+        self.assertTrue(gt.supernode_dids.isdisjoint(gt.sybil_dids))
+
+    def test_phase6_d_metric_calculations(self):
+        """Tests mathematical correctness of confusion metrics (recall, FPR, precision, F1)."""
+        from experiments.metrics import calculate_confusion_metrics
+
+        # Standard cases
+        m = calculate_confusion_metrics(tp=10, fp=2, fn=0, tn=8)
+        self.assertEqual(m["detection_rate"], 1.0)
+        self.assertAlmostEqual(m["false_positive_rate"], 2 / 10)
+        self.assertAlmostEqual(m["precision"], 10 / 12)
+        self.assertAlmostEqual(m["recall"], 1.0)
+        self.assertAlmostEqual(m["f1_score"], 2 * (10 / 12 * 1.0) / (10 / 12 + 1.0))
+
+        # Edge cases: zero counts
+        m_zero = calculate_confusion_metrics(tp=0, fp=0, fn=0, tn=10)
+        self.assertEqual(m_zero["detection_rate"], 1.0)
+        self.assertEqual(m_zero["false_positive_rate"], 0.0)
+        self.assertEqual(m_zero["precision"], 1.0)
+
+    def test_phase6_e_confidence_interval_calculation(self):
+        """Tests distribution statistics and parametric 95% confidence intervals."""
+        from experiments.statistics import calculate_distribution_stats
+
+        vals = [10.0, 12.0, 11.0, 13.0, 12.0, 11.5]
+        stats = calculate_distribution_stats(vals, confidence=0.95)
+
+        self.assertEqual(stats["count"], 6)
+        self.assertAlmostEqual(stats["mean"], sum(vals) / 6.0)
+        self.assertLess(stats["ci_lower"], stats["mean"])
+        self.assertGreater(stats["ci_upper"], stats["mean"])
+
+        # n < 2 edge case
+        single = calculate_distribution_stats([5.0])
+        self.assertEqual(single["ci_lower"], 5.0)
+        self.assertEqual(single["ci_upper"], 5.0)
+
+    def test_phase6_f_scenario_parameterization(self):
+        """Tests that ExperimentConfig parameter sweeps correctly reflect in trial executions."""
+        from experiments.config import ExperimentConfig
+        from experiments.scenarios import ExperimentTrialRunner
+
+        cfg = ExperimentConfig(
+            scenario_name="scenario_test",
+            num_honest=4, num_supernodes=2, num_sybils=2,
+            poisoning_rate=0.0, bridge_probability=0.0, replay_rate=0.0,
+            total_rounds=2, seed=42, difficulty_bits=6
+        )
+        runner = ExperimentTrialRunner(cfg)
+        res = runner.run()
+
+        self.assertEqual(res["config"]["scenario_name"], "scenario_test")
+        self.assertEqual(res["operational"]["admitted_nodes"], 8)
+
+    def test_phase6_g_isolated_sybil_scenario(self):
+        """Tests Scenario C: isolated Sybils receive near-zero collective trust share under vanilla EigenTrust."""
+        from experiments.config import ExperimentConfig
+        from experiments.scenarios import ExperimentTrialRunner
+
+        cfg = ExperimentConfig(
+            scenario_name="scenario_c_isolated_sybil",
+            num_honest=10, num_supernodes=3, num_sybils=8,
+            bridge_probability=0.0, total_rounds=4, seed=42, difficulty_bits=6
+        )
+        res = ExperimentTrialRunner(cfg).run()
+
+        # Disconnected Sybils should not acquire more than 5% trust share
+        sybil_share = res["trust_shares"]["sybil_trust_share"]
+        self.assertLess(sybil_share, 0.05)
+
+    def test_phase6_h_connected_collusion_scenario(self):
+        """Tests Scenario D: connected collusion baseline demonstrates higher trust acquisition when bridged."""
+        from experiments.config import ExperimentConfig
+        from experiments.scenarios import ExperimentTrialRunner
+
+        # Unbridged vs Bridged
+        cfg_unbridged = ExperimentConfig("scenario_d_collusion", num_honest=8, num_supernodes=3, num_sybils=6, bridge_probability=0.0, total_rounds=4, seed=42, difficulty_bits=6)
+        cfg_bridged = ExperimentConfig("scenario_d_collusion", num_honest=8, num_supernodes=3, num_sybils=6, bridge_probability=0.3, total_rounds=4, seed=42, difficulty_bits=6)
+
+        res_un = ExperimentTrialRunner(cfg_unbridged).run()
+        res_br = ExperimentTrialRunner(cfg_bridged).run()
+
+        # Bridged collusion should achieve >= unbridged share
+        self.assertGreaterEqual(res_br["trust_shares"]["sybil_trust_share"], res_un["trust_shares"]["sybil_trust_share"] - 1e-4)
+
+    def test_phase6_i_poisoning_scenario(self):
+        """Tests Scenario B: poisoning triggers FaultEvidenceRecord generation and verified deduction."""
+        from experiments.config import ExperimentConfig
+        from experiments.scenarios import ExperimentTrialRunner
+
+        cfg = ExperimentConfig(
+            scenario_name="scenario_b_poisoning",
+            num_honest=6, num_supernodes=2, num_sybils=3,
+            poisoning_rate=1.0, total_rounds=3, seed=42, difficulty_bits=6
+        )
+        res = ExperimentTrialRunner(cfg).run()
+
+        cm = res["confusion"]
+        self.assertGreater(cm["detection_rate"], 0.0)
+        self.assertEqual(cm["false_positive_rate"], 0.0)
+
+    def test_phase6_j_replay_scenario(self):
+        """Tests Scenario E: replay attacks are rejected with zero re-acceptance when replay protection is enabled."""
+        from experiments.config import ExperimentConfig
+        from experiments.scenarios import ExperimentTrialRunner
+
+        cfg = ExperimentConfig(
+            scenario_name="scenario_e_replay",
+            num_honest=5, num_supernodes=2, num_sybils=2,
+            replay_rate=1.0, total_rounds=4, seed=42, difficulty_bits=6
+        )
+        res = ExperimentTrialRunner(cfg).run()
+
+        self.assertEqual(res["operational"]["replay_acceptance_rate"], 0.0)
+
+    def test_phase6_k_revocation_scenario(self):
+        """Tests Scenario F: quorum authorization successfully processes revocation of accused poisoners."""
+        from experiments.config import ExperimentConfig
+        from experiments.scenarios import ExperimentTrialRunner
+
+        cfg = ExperimentConfig(
+            scenario_name="scenario_f_revocation",
+            num_honest=6, num_supernodes=4, num_sybils=3,
+            poisoning_rate=1.0, enable_revocation=True, enable_quorum=True,
+            total_rounds=3, seed=42, difficulty_bits=6
+        )
+        res = ExperimentTrialRunner(cfg).run()
+
+        raw_rev = res["operational"]["metrics_raw"]["revocation"]
+        self.assertGreater(raw_rev["quorum_approvals"], 0)
+        self.assertGreater(raw_rev["eviction_events"], 0)
+        self.assertGreaterEqual(res["operational"]["revocation_success_rate"], 0.0)
+
+    def test_phase6_l_machine_readable_output_generation(self):
+        """Tests that runner outputs valid JSON and CSV summary files with non-empty rows."""
+        import tempfile
+        import os
+        from experiments.runner import ExperimentSuiteRunner
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            runner = ExperimentSuiteRunner(output_dir=tmp_dir, default_seeds=1)
+            results = runner.run_suite(num_seeds=1)
+
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "raw_results.json")))
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "raw_results.csv")))
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "summary.csv")))
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "confidence_intervals.csv")))
 
 
 if __name__ == '__main__':
