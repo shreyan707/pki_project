@@ -1,8 +1,8 @@
 # Decentralized P2P PKI & Trust Management — Security Model
-**Document Version:** 2.1.0-SEC (Corrected Architecture Baseline)  
-**Status:** Approved Security Architecture  
+**Document Version:** 2.2.0-FROZEN (Frozen Security Architecture)  
+**Status:** Approved & Frozen for Implementation  
 **Target Architecture:** 4-Layer Hybrid P2P Trust Mesh  
-**Baseline Reference:** [AUDIT.md](file:///d:/pki_casestudy/AUDIT.md), [PROTOCOL_SPEC.md](file:///d:/pki_casestudy/PROTOCOL_SPEC.md)
+**Baseline References:** [AUDIT.md](reports/AUDIT.md), [PROTOCOL_FREEZE_REVIEW.md](reports/PROTOCOL_FREEZE_REVIEW.md), [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md)
 
 ---
 
@@ -39,7 +39,7 @@ We model an active, computationally bounded adversary $\mathcal{A}$ with polynom
    - $\mathcal{A}$ attempts to spawn thousands of virtual identities to dominate network voting or routing.
    - *Adversary Power:* Bounded by aggregate hash rate $H_{\mathcal{A}}$.
 2. **Collusion & Ballot Stuffing:**
-   - $\mathcal{A}$ controls a closed clique of $K$ peers who generate bilateral transactions praising each other with $+1.0$ ratings.
+   - $\mathcal{A}$ controls a closed clique of $K$ peers who generate bilateral transactions praising each other with `"+1.00"` ratings.
    - *Adversary Power:* Complete control over all identities within the collusive clique.
 3. **Chunk Inconsistency & Poisoning:**
    - $\mathcal{A}$ advertises authentic files or responds to download requests with chunk bytes that do not match the published Merkle root.
@@ -84,14 +84,14 @@ The protocol strictly separates six decoupled functional layers:
 | 2. Identity Admission    | Imposes computational join cost (PoW)              |
 | 3. Content Integrity     | Verifies chunk bits against signed Merkle root     |
 | 4. Transaction Evidence  | Dual-signed receipts & attributable fault proofs   |
-| 5. Behavioral Reputation | Global propagation of receipt scores via EigenTrust|
+| 5. Behavioral Reputation | Local & global propagation via EigenTrust          |
 | 6. Revocation            | m-of-n Supernode Quorum eviction of bad actors     |
 +--------------------------+----------------------------------------------------+
 ```
 
 ### 4.1 Tripartite Distinction in Delivery Failures
 
-To maintain scientific integrity, the security model strictly separates three concepts:
+The security model strictly separates three distinct concepts:
 
 ```
 +-------------------------------------------------------------------------------+
@@ -104,8 +104,8 @@ To maintain scientific integrity, the security model strictly separates three co
 +-------------------------------------------------------------------------------+
 | 2. Server-Attributable Inconsistent Delivery:                                 |
 |    Server signed a manifest committing to root R, AND signed a delivery       |
-|    envelope committing to H(B') for chunk k under root R, where H(B')         |
-|    mathematically contradicts root R.                                         |
+|    envelope committing to H(B') and H(Pi_S) for chunk k under root R,         |
+|    WHILE an authentic inclusion proof proves genuine leaf L_auth != H(B').    |
 |    Observation: Cryptographic contradiction bound to server's private key.    |
 |    Does NOT prove: Malicious intent.                                          |
 +-------------------------------------------------------------------------------+
@@ -141,6 +141,7 @@ This section explicitly defines what each mechanism **PROVIDES** and what it **D
 - **PROPERTY NOT PROVIDED:**
   - **Semantic Correctness / Safety:** A valid Merkle proof **does not prove** that the file content is safe, accurate, uncorrupted prior to hashing, or malware-free.
   - **Root Authenticity:** A Merkle proof **does not prove** the root $R$ itself is legitimate. Root trustworthiness depends entirely on publisher signature verification.
+  - **Non-Membership Proof by Failure:** A failed inclusion proof **does not prove** non-membership by itself (a malicious complainant could supply a bad proof alongside authentic data). Non-membership requires demonstrating that an authentic proof reaches root $R$ with a conflicting leaf digest $L_{\text{authentic}} \ne H(B')$.
 
 ### 5.3 Digital Signatures (Ed25519)
 
@@ -151,37 +152,39 @@ This section explicitly defines what each mechanism **PROVIDES** and what it **D
   - **Truthfulness of Statement:** A digital signature **does not guarantee** that the claims within the payload are true. A malicious peer can sign false receipts, corrupted manifests, or dishonest ratings.
   - **Real-World Identity Verification:** Proves ownership of a cryptographic key, not the legal, physical, or moral identity of the operator.
 
-### 5.4 Bilateral Transaction Receipts
+### 5.4 Bilateral Transaction Receipts (`"+1.00"`)
 
 - **PROPERTY PROVIDED:**
   - **Mutual Interaction Agreement:** Proves that both Client $C$ and Server $S$ agreed to a transaction outcome and rating at timestamp $t_{tx}$.
   - **Unilateral Forgery Resistance:** Neither party can unilaterally fabricate a valid positive bilateral receipt without the counterparty's private key.
 - **PROPERTY NOT PROVIDED:**
-  - **Collusion Resistance:** Two colluding malicious peers can freely co-sign infinite positive receipts for dummy or non-existent file transfers.
+  - **Collusion Resistance:** Two colluding malicious peers can freely co-sign positive receipts for dummy or non-existent file transfers.
   - **Physical Delivery Verification:** Proves cryptographic consensus between two keys, not physical packet delivery across IP networks.
 
-### 5.5 Bilateral Negative Receipts ($-1.0$ Rating)
+### 5.5 Bilateral Dispute Receipts (`"-1.00"`)
 
 - **PROPERTY PROVIDED:**
   - **Mutual Dispute Acknowledgement:** Proves that both parties co-signed an agreement that a transaction was cancelled, unfulfilled, or disputed.
   - **Subjective Behavioral Signal:** Provides a negative delta in the local satisfaction matrix ($S_{C, S} \leftarrow S_{C, S} - 1.0$).
 - **PROPERTY NOT PROVIDED:**
-  - **Proof of Malicious Behavior:** A $-1.0$ receipt **does not prove** malicious behavior, fraud, or chunk poisoning. It is a mutually acknowledged contractual dispute and does not trigger supernode revocation.
+  - **Proof of Malicious Behavior:** A `"-1.00"` receipt **does not prove** malicious behavior, fraud, or chunk poisoning. It is a mutually acknowledged contractual dispute and does not trigger supernode revocation.
 
 ### 5.6 Server-Attributable Delivery Evidence (`FaultEvidenceRecord`)
 
 - **PROPERTY PROVIDED:**
-  - **Cryptographic Attribution of Inconsistency:** Mathematically proves that the server's private key signed a delivery commitment for request $ReqID$ containing a chunk hash that contradicts the root published in the server's signed manifest.
+  - **Cryptographic Attribution of Inconsistency:** Mathematically proves that the server's private key signed a delivery commitment for request $ReqID$ containing a chunk hash that contradicts the authentic leaf digest committed to under root $R$.
   - **Admissible Revocation Evidence:** Provides objective, verifiable justification for supernode quorum evaluation and CRR generation.
 - **PROPERTY NOT PROVIDED:**
   - **Proof of Malicious Intent:** Cryptography **cannot distinguish** between intentional poisoning, a storage drive bit-flip, a faulty caching proxy, or a software index bug.
 
-### 5.7 Canonical Evidence Accounting & Replay Protection
+### 5.7 Evidence Accounting & Replay Protection
 
 - **PROPERTY PROVIDED:**
-  - **At-Most-Once Reputation Contribution:** Guarantees that any transaction or evidence item contributes to the satisfaction matrix at most once based on its globally unique canonical identifier ($TxID$ or $EvidenceID$), regardless of relay count.
+  - **Local At-Most-Once Accounting:** Node-Local Processed Evidence Journal ($\mathcal{L}_{\text{local}}$) guarantees that an individual peer credits a given $TxID$ or $EvidenceID$ at most once to its local satisfaction matrix $S$.
+  - **Simulation Benchmark Single Accounting:** Simulator Canonical Evidence Journal ($\mathcal{L}_{\text{sim}}$) guarantees that in-memory simulation runs apply each simulated interaction at most once.
   - **Freshness Bounding:** Rejects historical receipts generated outside sliding window $W = 600\text{ seconds}$.
 - **PROPERTY NOT PROVIDED:**
+  - **Distributed Consensus / Global Ledger:** In the absence of Byzantine consensus, the system **does not provide a global distributed ledger**. Different peers may hold different local evidence journals and therefore different local trust matrices.
   - **Fresh Collusion Nonce Prevention:** Does not prevent colluders from generating continuous fresh nonces and unique transaction IDs for new dummy transactions.
 
 ### 5.8 EigenTrust Algorithm
@@ -228,23 +231,26 @@ This section explicitly defines what each mechanism **PROVIDES** and what it **D
      |                    |    ACTIVE     |
      |                    +---------------+
      |                            |
-     | [T3] Evidence Disproven    | [T2] Attributable Inconsistency Certified
-     |      or Timeout Expired    v
+     | [T3a] Unverified           | [T2] Certified Fault OR
+     |       Suspicion Expired    |      Subjective Suspicion
+     |       (T_susp)             v
      |                    +---------------+
-     +--------------------|   SUSPECTED   |
-                          +---------------+
-                                  |
-                                  | [T4] Quorum Threshold Sponsor
-                                  v
-                      +-----------------------+
-                      |  REVOCATION_PROPOSED  |
-                      +-----------------------+
-                                  |
-                                  | [T5] m-of-n Supernode Quorum (CRR Signed)
-                                  v
-                          +---------------+
-                          |    REVOKED    |  (Terminal State / Eviction)
-                          +---------------+
+     +--------------------|   SUSPECTED   |<-------------------------+
+                          +---------------+                          |
+                                  |                                  |
+                                  | [T4] Quorum Threshold Sponsor     |
+                                  v                                  |
+                      +-----------------------+                      |
+                      |  REVOCATION_PROPOSED  |                      |
+                      +-----------------------+                      |
+                             |         \                             |
+                             |          \ [T5b] Quorum Timeout (T_vote)
+                 [T5a] Quorum|           \      Fallback (k < m)     |
+                      Approved|            +--------------------------+
+                             v
+                     +---------------+
+                     |    REVOKED    |  (Terminal State / Eviction)
+                     +---------------+
 ```
 
 ### Transition Specifications
@@ -252,10 +258,13 @@ This section explicitly defines what each mechanism **PROVIDES** and what it **D
 | Transition | From State | To State | Trigger Condition | Validating Entity |
 | :--- | :--- | :--- | :--- | :--- |
 | **T1: Admission** | `UNKNOWN` | `ACTIVE` | Valid PoW ($D \ge D_{\min}$) + valid self-signature + fresh timestamp | Admission Verifier |
-| **T2: Detection** | `ACTIVE` | `SUSPECTED` | Attributable inconsistent delivery certified via signed manifest + signed delivery envelope | Downloading Peer |
-| **T3: Exoneration** | `SUSPECTED` | `ACTIVE` | Suspicion timer $T_{\text{susp}}$ expires without corroboration, or proof rebutted | Local Peer Engine |
+| **T2a: Attributable Fault** | `ACTIVE` | `SUSPECTED` | Validated `FaultEvidenceRecord` (authentic proof + server delivery envelope) | Local Node / Swarm |
+| **T2b: Subjective Suspicion**| `ACTIVE` | `SUSPECTED` | Delivery timeout, uncooperative peer, or unverified unilateral complaint | Local Node |
+| **T3a: Exoneration (Subjective)**| `SUSPECTED` | `ACTIVE` | Suspicion timer $T_{\text{susp}}$ expires without corroboration | Local Peer Engine (Only for unverified suspicion) |
+| **T3b: Certified Persistence** | `SUSPECTED` | `SUSPECTED` | $T_{\text{susp}}$ expires for certified attributable fault | **NO EXPIRATION.** Retains certified suspicion until T4, adjudication, or rotation. |
 | **T4: Escalation** | `SUSPECTED` | `REVOCATION_PROPOSED` | Formal `PROPOSE_REVOCATION` message accompanied by certified `FaultEvidenceRecord` | Supernode Committee |
-| **T5: Revocation** | `REVOCATION_PROPOSED` | `REVOKED` | $\ge m$ valid supernode signatures assembled on CRR payload | Network / All Peers |
+| **T5a: Revocation** | `REVOCATION_PROPOSED` | `REVOKED` | $\ge m$ valid supernode signatures assembled on CRR payload | Network / All Peers |
+| **T5b: Quorum Timeout Fallback**| `REVOCATION_PROPOSED` | `SUSPECTED` | $T_{\text{vote}}$ expires without reaching quorum ($k < m$) | Supernode Committee (**NEVER** returns to ACTIVE) |
 
 ---
 
