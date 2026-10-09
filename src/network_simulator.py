@@ -34,7 +34,7 @@ from src.layer3_eigentrust import (
     MerkleTree, BilateralReceipt, EigenTrustEngine,
     verify_merkle_proof, hash_proof,
     ContentManifest, ContentRequest, ChunkResponse, FaultEvidenceRecord,
-    SimulatorCanonicalJournal
+    SimulatorCanonicalJournal, TrustComputationMode
 )
 
 # Layer 4
@@ -116,13 +116,17 @@ class SwarmSimulation:
         num_supernodes: int = 5,
         num_sybils: int = 15,
         seed: int = 42,
-        difficulty_bits: int = 8
+        difficulty_bits: int = 8,
+        trust_mode: str = TrustComputationMode.VANILLA
     ):
         self.seed = seed
         random.seed(seed)
         np.random.seed(seed)
 
         self.difficulty_bits = difficulty_bits
+        self.trust_computation_mode = trust_mode
+        self.verified_delivery_keys: Set[Tuple[str, str, str, str]] = set()
+        self.known_manifest_roots: Set[str] = set()
         self.mesh = MeshPKINetwork(max_hops=4)
         self.nodes: Dict[str, SimulatedNode] = {}
         self.supernodes: List[SimulatedNode] = []
@@ -239,6 +243,8 @@ class SwarmSimulation:
         # Honest nodes and supernodes publish initial content
         for node in self.honest_nodes + self.supernodes:
             node.generate_file(f"content-{node.alias}-init", size_kb=64, chunk_size_kb=16)
+            for m in node.manifests.values():
+                self.known_manifest_roots.add(m.root_hash.lower())
 
     def _admit_node(self, node: SimulatedNode) -> bool:
         """
@@ -370,6 +376,10 @@ class SwarmSimulation:
                     self.metrics["trust"]["s_updates"] += 1
                     stats["honest_success"] += 1
                     self.committed_receipts.append(receipt)
+                    self.verified_delivery_keys.add(
+                        (client.did, provider.did, manifest.root_hash.lower(), tx_id)
+                    )
+                    self.known_manifest_roots.add(manifest.root_hash.lower())
 
                     # Tit-for-tat uploader fulfillment receipt
                     tx_recip_id = f"tx-recip-r{round_num}-{provider.alias}-{client.alias}"
@@ -439,6 +449,10 @@ class SwarmSimulation:
                 if self.eigentrust.record_receipt(audit_receipt):
                     self.metrics["evidence"]["positive_receipts"] += 1
                     self.metrics["trust"]["s_updates"] += 1
+                    self.verified_delivery_keys.add(
+                        (sn.did, audited.did, m.root_hash.lower(), audit_tx_id)
+                    )
+                    self.known_manifest_roots.add(m.root_hash.lower())
 
         # --- B. Sybil Collusion Ring (Connected Baseline) ---
         active_sybils = [s for s in self.sybil_nodes if s.did in self.mesh.peers and s.identity.state == PeerState.ACTIVE]
@@ -733,7 +747,14 @@ class SwarmSimulation:
             stats = self.execute_transaction_round(r)
             history["stats"].append(stats)
 
-            scores = self.eigentrust.get_trust_scores()
+            scores = self.eigentrust.get_trust_scores(
+                mode=self.trust_computation_mode,
+                verified_delivery_keys=self.verified_delivery_keys,
+                known_manifest_roots=self.known_manifest_roots,
+                certified_suspicion_dids={
+                    did for did, rec in getattr(self.coordinator, "suspicion_records", {}).items() if rec.get("is_certified")
+                } if hasattr(self, "coordinator") else None
+            )
             sn_scores = [scores[sn.did] for sn in self.supernodes if sn.did in scores]
             h_scores = [scores[h.did] for h in self.honest_nodes if h.did in scores]
             syb_scores = [scores[s.did] for s in self.sybil_nodes if s.did in scores]
@@ -743,7 +764,7 @@ class SwarmSimulation:
             history["sybil_avg"].append(float(np.mean(syb_scores)) if syb_scores else 0.0)
 
         self.metrics["trust"]["eigentrust_iterations"] = total_rounds
-        self.metrics["trust"]["final_trust_vector"] = self.eigentrust.get_trust_scores()
+        self.metrics["trust"]["final_trust_vector"] = scores
         return history
 
 

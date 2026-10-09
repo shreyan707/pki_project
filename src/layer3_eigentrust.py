@@ -7,6 +7,7 @@ ordered 7-stage evidence validation pipeline, and the EigenTrust power-iteration
 """
 
 import hashlib
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -14,6 +15,21 @@ from typing import List, Dict, Tuple, Optional, Any, Set, Union
 import numpy as np
 
 from src.layer1_identity import PeerIdentity, PeerState
+
+
+# =============================================================================
+# TRUST COMPUTATION MODES
+# =============================================================================
+
+class TrustComputationMode:
+    VANILLA = "vanilla_eigentrust"
+    EVIDENCE_ONLY = "evidence_only"       # Authoritative proposed EW-EigenTrust
+    TOPOLOGY_ONLY = "topology_only"       # Experimental ablation
+    FULL_EW = "full_ew_eigentrust"         # Experimental ablation
+    LOCAL_ONLY = "local_only"
+
+    VALID_MODES = {VANILLA, EVIDENCE_ONLY, TOPOLOGY_ONLY, FULL_EW, LOCAL_ONLY}
+
 
 
 # =============================================================================
@@ -537,6 +553,10 @@ class LocalEvidenceJournal:
         )
         return True
 
+    def get_all_entries(self) -> List[JournalEntry]:
+        """Public accessor returning all committed journal entries."""
+        return list(self._entries.values())
+
     def __len__(self) -> int:
         return len(self._entries)
 
@@ -573,6 +593,7 @@ class EigenTrustEngine:
         """
         self.peers = sorted(peers)
         self.peer_to_idx = {did: idx for idx, did in enumerate(self.peers)}
+        self.pre_trusted_peers = list(pre_trusted_peers)
         self.n = len(self.peers)
         self.alpha = alpha
         self.freshness_window = freshness_window
@@ -692,7 +713,9 @@ class EigenTrustEngine:
                 "client_did": receipt.client_did,
                 "server_did": receipt.server_did,
                 "rating": delta,
-                "nonce": receipt.nonce
+                "nonce": receipt.nonce,
+                "merkle_root": receipt.merkle_root,
+                "receipt_timestamp": receipt.timestamp
             }
         )
         if not committed:
@@ -842,7 +865,375 @@ class EigenTrustEngine:
                 
         return t
 
-    def get_trust_scores(self) -> Dict[str, float]:
-        """Returns dictionary of DID -> normalized global trust score."""
-        scores = self.run_power_iteration()
-        return {self.peers[i]: float(scores[i]) for i in range(self.n)}
+    def compute_ew_trust_scores(
+        self,
+        mode: str = TrustComputationMode.EVIDENCE_ONLY,
+        verified_delivery_keys: Optional[Set[Tuple[str, str, str, str]]] = None,
+        known_manifest_roots: Optional[Set[str]] = None,
+        certified_suspicion_dids: Optional[Set[str]] = None,
+        reference_time: Optional[float] = None,
+        k_max: float = 10.0,
+        lambda_sat: float = 0.50,
+        mu_unverified: float = 0.10,
+        mu_referenced: float = 0.25,
+        beta_entropy: float = 2.0,
+        theta_penalty: float = 0.85,
+        epsilon_floor: float = 0.10,
+        delta_reg: float = 2.0,
+        tau_seconds: float = 86400.0,
+        max_iter: int = 100,
+        tol: float = 1e-6,
+        **kwargs
+    ) -> Tuple[Dict[str, float], bool, int]:
+        """
+        Computes trust scores using EW-EigenTrust v1.8.
+        Returns: (trust_scores: Dict[str, float], converged: bool, executed_iters: int)
+        """
+        raw_s: Dict[Tuple[str, str], float] = {}
+        for i in range(self.n):
+            for j in range(self.n):
+                if i != j and self.S[i, j] != 0:
+                    raw_s[(self.peers[i], self.peers[j])] = float(self.S[i, j])
+
+        return compute_ew_eigentrust_v1_8(
+            peers=self.peers,
+            supernodes=getattr(self, "pre_trusted_peers", []),
+            raw_s_matrix=raw_s,
+            evidence_journal=self.local_journal,
+            peer_states=self.peer_states,
+            certified_suspicion_dids=certified_suspicion_dids,
+            verified_delivery_keys=verified_delivery_keys,
+            known_manifest_roots=known_manifest_roots,
+            mode=mode,
+            alpha=self.alpha,
+            k_max=k_max,
+            lambda_sat=lambda_sat,
+            mu_unverified=mu_unverified,
+            mu_referenced=mu_referenced,
+            beta_entropy=beta_entropy,
+            theta_penalty=theta_penalty,
+            epsilon_floor=epsilon_floor,
+            delta_reg=delta_reg,
+            tau_seconds=tau_seconds,
+            max_iter=max_iter,
+            tol=tol,
+            reference_time=reference_time
+        )
+
+    def get_trust_scores(
+        self,
+        mode: str = TrustComputationMode.VANILLA,
+        verified_delivery_keys: Optional[Set[Tuple[str, str, str, str]]] = None,
+        known_manifest_roots: Optional[Set[str]] = None,
+        certified_suspicion_dids: Optional[Set[str]] = None,
+        reference_time: Optional[float] = None,
+        **kwargs
+    ) -> Dict[str, float]:
+        """
+        Returns dictionary of DID -> normalized global trust score.
+        If mode is VANILLA, uses standard power iteration on raw S.
+        If mode is EVIDENCE_ONLY (or other EW mode), computes via compute_ew_eigentrust_v1_8.
+        """
+        if mode == TrustComputationMode.VANILLA:
+            scores = self.run_power_iteration()
+            return {self.peers[i]: float(scores[i]) for i in range(self.n)}
+
+        scores, _, _ = self.compute_ew_trust_scores(
+            mode=mode,
+            verified_delivery_keys=verified_delivery_keys,
+            known_manifest_roots=known_manifest_roots,
+            certified_suspicion_dids=certified_suspicion_dids,
+            reference_time=reference_time,
+            **kwargs
+        )
+        return scores
+
+
+# =============================================================================
+# EW-EIGENTRUST V1.8 ALGORITHM (EVIDENCE-ONLY AUTHORITATIVE IMPLEMENTATION)
+# =============================================================================
+
+def compute_ew_eigentrust_v1_8(
+    peers: List[str],
+    supernodes: List[str],
+    raw_s_matrix: Dict[Tuple[str, str], float],
+    evidence_journal: Any = None,
+    peer_states: Optional[Dict[str, Any]] = None,
+    certified_suspicion_dids: Optional[Set[str]] = None,
+    verified_delivery_keys: Optional[Set[Tuple[str, str, str, str]]] = None,
+    known_manifest_roots: Optional[Set[str]] = None,
+    mode: str = TrustComputationMode.EVIDENCE_ONLY,
+    alpha: float = 0.15,
+    k_max: float = 10.0,
+    lambda_sat: float = 0.50,
+    mu_unverified: float = 0.10,
+    mu_referenced: float = 0.25,
+    beta_entropy: float = 2.0,
+    theta_penalty: float = 0.85,
+    epsilon_floor: float = 0.10,
+    delta_reg: float = 2.0,
+    tau_seconds: float = 86400.0,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+    reference_time: Optional[float] = None
+) -> Tuple[Dict[str, float], bool, int]:
+    """
+    Computes global trust vector using EW-EigenTrust v1.8.
+    Returns: (trust_scores: Dict[str, float], converged: bool, executed_iters: int)
+    """
+    # 1. Parameter Validation (Reject bool strictly)
+    if mode not in TrustComputationMode.VALID_MODES:
+        raise ValueError(f"Invalid trust computation mode: {mode}")
+    if isinstance(alpha, bool) or not (isinstance(alpha, (int, float)) and math.isfinite(alpha) and 0.0 < alpha < 1.0):
+        raise ValueError(f"alpha must be finite in (0, 1), got {alpha}")
+    if isinstance(tol, bool) or not (isinstance(tol, (int, float)) and math.isfinite(tol) and tol > 0.0):
+        raise ValueError(f"tol must be finite positive, got {tol}")
+    if isinstance(max_iter, bool) or not (isinstance(max_iter, int) and max_iter >= 1):
+        raise ValueError(f"max_iter must be an integer >= 1, got {max_iter}")
+    if isinstance(k_max, bool) or not (isinstance(k_max, (int, float)) and math.isfinite(k_max) and k_max > 0.0):
+        raise ValueError(f"k_max must be finite positive, got {k_max}")
+    if isinstance(lambda_sat, bool) or not (isinstance(lambda_sat, (int, float)) and math.isfinite(lambda_sat) and lambda_sat > 0.0):
+        raise ValueError(f"lambda_sat must be finite positive, got {lambda_sat}")
+    if isinstance(mu_unverified, bool) or not (isinstance(mu_unverified, (int, float)) and math.isfinite(mu_unverified) and 0.0 <= mu_unverified <= 1.0):
+        raise ValueError(f"mu_unverified must be in [0, 1], got {mu_unverified}")
+    if isinstance(mu_referenced, bool) or not (isinstance(mu_referenced, (int, float)) and math.isfinite(mu_referenced) and 0.0 <= mu_referenced <= 1.0):
+        raise ValueError(f"mu_referenced must be in [0, 1], got {mu_referenced}")
+    if mu_unverified > mu_referenced:
+        raise ValueError(f"mu_unverified ({mu_unverified}) cannot exceed mu_referenced ({mu_referenced})")
+    if isinstance(beta_entropy, bool) or not (isinstance(beta_entropy, (int, float)) and math.isfinite(beta_entropy) and beta_entropy > 0.0):
+        raise ValueError(f"beta_entropy must be finite positive, got {beta_entropy}")
+    if isinstance(theta_penalty, bool) or not (isinstance(theta_penalty, (int, float)) and math.isfinite(theta_penalty) and 0.0 <= theta_penalty <= 1.0):
+        raise ValueError(f"theta_penalty must be in [0, 1], got {theta_penalty}")
+    if isinstance(epsilon_floor, bool) or not (isinstance(epsilon_floor, (int, float)) and math.isfinite(epsilon_floor) and 0.0 < epsilon_floor <= 1.0):
+        raise ValueError(f"epsilon_floor must be in (0, 1], got {epsilon_floor}")
+    if isinstance(delta_reg, bool) or not (isinstance(delta_reg, (int, float)) and math.isfinite(delta_reg) and delta_reg > 0.0):
+        raise ValueError(f"delta_reg must be finite positive, got {delta_reg}")
+    if isinstance(tau_seconds, bool) or not (isinstance(tau_seconds, (int, float)) and math.isfinite(tau_seconds) and tau_seconds > 0.0):
+        raise ValueError(f"tau_seconds must be finite positive, got {tau_seconds}")
+    if reference_time is not None:
+        if isinstance(reference_time, bool) or not (isinstance(reference_time, (int, float)) and math.isfinite(reference_time)):
+            raise ValueError(f"reference_time must be a finite float or None, got {reference_time}")
+
+    # 2. Canonical Peer Set & Empty Network Handling
+    if not peers:
+        return {}, True, 0
+
+    canonical_peers = sorted(list(set(str(p) for p in peers if p and isinstance(p, str))))
+    n = len(canonical_peers)
+    if n == 0:
+        return {}, True, 0
+
+    peer_to_idx = {did: idx for idx, did in enumerate(canonical_peers)}
+    valid_supernodes = sorted(list(set(str(sn) for sn in (supernodes or []) if str(sn) in peer_to_idx)))
+    manifest_roots = {str(r).lower() for r in (known_manifest_roots or set()) if isinstance(r, str)}
+    delivery_keys = set()
+    if verified_delivery_keys:
+        for k in verified_delivery_keys:
+            if isinstance(k, tuple) and len(k) == 4:
+                delivery_keys.add((str(k[0]), str(k[1]), str(k[2]).lower(), str(k[3])))
+
+    states = peer_states or {}
+    certified_suspected = set(str(s) for s in (certified_suspicion_dids or set()))
+    t_ref = float(reference_time) if reference_time is not None else None
+
+    # 3. Pre-trusted restart vector p
+    p = np.zeros(n, dtype=np.float64)
+    if valid_supernodes:
+        sn_weight = 1.0 / len(valid_supernodes)
+        for sn in valid_supernodes:
+            p[peer_to_idx[sn]] = sn_weight
+    else:
+        p.fill(1.0 / n)
+
+    # 4. Fast path: Local-only baseline
+    if mode == TrustComputationMode.LOCAL_ONLY:
+        scores = {}
+        total = 0.0
+        for src in canonical_peers:
+            s_sum = 0.0
+            for dst in canonical_peers:
+                if dst != src:
+                    val = raw_s_matrix.get((src, dst), 0.0)
+                    if not isinstance(val, bool) and isinstance(val, (int, float)) and math.isfinite(val):
+                        s_sum += max(0.0, float(val))
+            scores[src] = s_sum
+            total += s_sum
+        if total > 0.0:
+            return {did: float(v / total) for did, v in scores.items()}, True, 0
+        return {did: float(1.0 / n) for did in canonical_peers}, True, 0
+
+    # 5. Extract journal entries defensively
+    certified_fault_accused: Set[str] = set()
+    pair_entries: Dict[Tuple[str, str], List[Any]] = {}
+
+    if mode in (TrustComputationMode.EVIDENCE_ONLY, TrustComputationMode.FULL_EW):
+        raw_entries = []
+        if evidence_journal is not None:
+            if hasattr(evidence_journal, "get_all_entries") and callable(evidence_journal.get_all_entries):
+                raw_entries = evidence_journal.get_all_entries()
+            elif hasattr(evidence_journal, "_entries") and isinstance(evidence_journal._entries, dict):
+                raw_entries = list(evidence_journal._entries.values())
+
+        for entry in raw_entries:
+            entry_type = getattr(entry, "entry_type", "")
+            details = getattr(entry, "details", {})
+            if not isinstance(details, dict):
+                details = {}
+
+            if entry_type == "FAULT_EVIDENCE":
+                accused = details.get("accused_did")
+                if isinstance(accused, str) and accused in peer_to_idx:
+                    certified_fault_accused.add(accused)
+            elif entry_type == "RECEIPT":
+                c = details.get("client_did")
+                s = details.get("server_did")
+                if isinstance(c, str) and isinstance(s, str) and c in peer_to_idx and s in peer_to_idx and c != s:
+                    pair_entries.setdefault((c, s), []).append(entry)
+
+    # 6. Construct base interaction matrix A_ij
+    A = np.zeros((n, n), dtype=np.float64)
+
+    for i, src in enumerate(canonical_peers):
+        for j, dst in enumerate(canonical_peers):
+            if i == j:
+                continue
+
+            # Vanilla & Topology-Only Modes: Direct raw S matrix
+            if mode in (TrustComputationMode.VANILLA, TrustComputationMode.TOPOLOGY_ONLY):
+                raw_score = raw_s_matrix.get((src, dst), 0.0)
+                if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)) or not math.isfinite(raw_score):
+                    raw_score = 0.0
+                A[i, j] = max(0.0, float(raw_score))
+                continue
+
+            # Evidence Modes (EVIDENCE_ONLY, FULL_EW):
+            state_val = str(getattr(states.get(dst), "value", states.get(dst, "ACTIVE")))
+            is_cert_fault = (dst in certified_fault_accused)
+            is_revoking = (state_val in ("REVOCATION_PROPOSED", "REVOKED"))
+            is_cert_susp = (state_val == "SUSPECTED" and dst in certified_suspected)
+
+            if is_cert_fault or is_revoking or is_cert_susp:
+                A[i, j] = 0.0
+                continue
+
+            entries = pair_entries.get((src, dst), [])
+            e_pos = 0.0
+            n_pos_count = 0.0
+            n_neg_count = 0.0
+
+            for e in entries:
+                details = getattr(e, "details", {})
+                if not isinstance(details, dict):
+                    continue
+
+                raw_rating = details.get("rating", 1.0)
+                try:
+                    if isinstance(raw_rating, bool):
+                        continue
+                    rating_val = float(raw_rating)
+                    if not math.isfinite(rating_val):
+                        continue
+                except (ValueError, TypeError):
+                    continue
+
+                if rating_val > 0.0:
+                    n_pos_count += 1.0
+                    m_root = str(details.get("merkle_root", "")).strip().lower()
+                    tx_id = str(getattr(e, "entry_id", ""))
+
+                    if (src, dst, m_root, tx_id) in delivery_keys:
+                        gamma_ev = 1.00  # Tier 3: Local Verified Delivery
+                    elif m_root and m_root in manifest_roots:
+                        gamma_ev = mu_referenced  # Tier 2: Manifest Referenced
+                    else:
+                        gamma_ev = mu_unverified  # Tier 1: Unindexed Receipt
+
+                    raw_ts = details.get("receipt_timestamp", getattr(e, "timestamp", 0.0))
+                    try:
+                        e_ts = float(raw_ts)
+                        if not math.isfinite(e_ts):
+                            e_ts = 0.0
+                    except (ValueError, TypeError):
+                        e_ts = 0.0
+
+                    if t_ref is not None:
+                        dt = t_ref - e_ts
+                        if dt < -60.0:
+                            gamma_time = 0.0
+                        elif dt <= 0.0:
+                            gamma_time = 1.0
+                        else:
+                            gamma_time = math.exp(-dt / tau_seconds)
+                    else:
+                        gamma_time = 1.0
+
+                    e_pos += gamma_ev * gamma_time
+                elif rating_val < 0.0:
+                    n_neg_count += 1.0
+                else:
+                    pass  # rating_val == 0.0 is neutral, skipped
+
+            if n_pos_count > 0.0 and e_pos > 0.0:
+                gamma_dispute = max(0.0, 1.0 - (2.0 * n_neg_count / (n_pos_count + 1.0)))
+                phi_val = k_max * math.tanh((lambda_sat * e_pos) / k_max)
+                A[i, j] = phi_val * gamma_dispute
+            else:
+                A[i, j] = 0.0
+
+    # 7. Topology Damping (Active strictly in ablation modes)
+    Omega = np.ones((n, n), dtype=np.float64)
+
+    if mode in (TrustComputationMode.TOPOLOGY_ONLY, TrustComputationMode.FULL_EW):
+        H = np.zeros(n, dtype=np.float64)
+        denom_norm = math.log(max(2, n - 1))
+        for i in range(n):
+            row_sum = np.sum(A[i, :])
+            if row_sum > 0:
+                p_dist = A[i, :] / row_sum
+                nonzero_p = p_dist[p_dist > 0]
+                entropy = -np.sum(nonzero_p * np.log(nonzero_p))
+                H[i] = min(1.0, max(0.0, entropy / denom_norm))
+            else:
+                H[i] = 0.0
+
+        for i in range(n):
+            for j in range(n):
+                if i != j and A[i, j] > 0:
+                    a_ij = A[i, j]
+                    a_ji = A[j, i]
+                    rho_ij = (2.0 * min(a_ij, a_ji)) / (a_ij + a_ji + delta_reg)
+                    min_entropy = min(H[i], H[j])
+                    sigma_ij = rho_ij * math.pow(1.0 - min_entropy, beta_entropy)
+                    Omega[i, j] = max(epsilon_floor, 1.0 - (theta_penalty * sigma_ij))
+
+    # 8. Effective Matrix S_prime and Stochastic Matrix C_prime
+    S_prime = Omega * A
+    C_prime = np.zeros((n, n), dtype=np.float64)
+
+    for i in range(n):
+        row_total = np.sum(S_prime[i, :])
+        if row_total > 0:
+            C_prime[i, :] = S_prime[i, :] / row_total
+        else:
+            C_prime[i, :] = p  # Dangling row fallback
+
+    # 9. Power Iteration (Euclidean L2 norm stopping criterion)
+    t = p.copy()
+    C_prime_T = C_prime.T
+    converged = False
+    executed_iters = 0
+
+    for iteration in range(1, max_iter + 1):
+        executed_iters = iteration
+        t_next = (1.0 - alpha) * np.dot(C_prime_T, t) + (alpha * p)
+        delta = np.linalg.norm(t_next - t)
+        t = t_next
+        if delta < tol:
+            converged = True
+            break
+
+    return {canonical_peers[i]: float(t[i]) for i in range(n)}, converged, executed_iters
+
+
+compute_ew_eigentrust = compute_ew_eigentrust_v1_8
+
