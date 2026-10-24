@@ -2,8 +2,8 @@
 Phase 8.2 Empirical Validation Benchmark Suite
 =============================================
 Author: Candidate Shreyan Nayak (23BKT0039) & Independent Statistical Auditor
-Preregistration Target: PHASE8_2_PREREGISTRATION.md
-Specification: NOVEL_TRUST_ALGORITHM_DESIGN_V1_8.md
+Preregistration Target: agent_instructions/PHASE8_2_PREREGISTRATION.md
+Specification: agent_instructions/NOVEL_TRUST_ALGORITHM_DESIGN_V1_8.md
 
 Executes paired empirical comparisons across 9 scenarios, 20 random seeds,
 2 network scales, and 3 trust computation modes:

@@ -25,8 +25,8 @@ RAW_JSON_PATH = "results/phase8_2_raw_results.json"
 RAW_CSV_PATH = "results/phase8_2_raw_results.csv"
 SUMMARY_CSV_PATH = "results/phase8_2_summary.csv"
 COMP_CSV_PATH = "results/phase8_2_statistical_comparison.csv"
-REPORT_MD_PATH = "PHASE8_2_BENCHMARK_REPORT.md"
-PREREG_MD_PATH = "PHASE8_2_PREREGISTRATION.md"
+REPORT_MD_PATH = "agent_instructions/PHASE8_2_BENCHMARK_REPORT.md"
+PREREG_MD_PATH = "agent_instructions/PHASE8_2_PREREGISTRATION.md"
 
 
 def get_file_hash(path: str) -> str:

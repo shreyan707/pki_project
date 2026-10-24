@@ -369,7 +369,7 @@ def create_ieee_docx():
         run.font.name = 'Times New Roman'
         run.font.size = Pt(8.5)
 
-    output_path = "PKI_Trust_Management_IEEE_Research_Report.docx"
+    output_path = "deliverable_reports/PKI_Trust_Management_IEEE_Research_Report.docx"
     doc.save(output_path)
     print(f"Successfully generated {output_path} (Size: {os.path.getsize(output_path)} bytes)")
 
