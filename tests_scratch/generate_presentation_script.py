@@ -457,7 +457,7 @@ def create_script_documents():
         md_lines.append("---")
         md_lines.append("")
 
-    with open("PKI_Trust_Management_Presentation_Script.md", "w", encoding="utf-8") as f:
+    with open("deliverable_reports/PKI_Trust_Management_Presentation_Script.md", "w", encoding="utf-8") as f:
         f.write("\n".join(md_lines))
     print("Generated PKI_Trust_Management_Presentation_Script.md successfully.")
 
@@ -591,7 +591,7 @@ def create_script_documents():
         r_div.font.size = Pt(8)
         r_div.font.color.rgb = RGBColor(203, 213, 225)
 
-    doc.save("PKI_Trust_Management_Presentation_Script.docx")
+    doc.save("deliverable_reports/PKI_Trust_Management_Presentation_Script.docx")
     print("Generated PKI_Trust_Management_Presentation_Script.docx successfully.")
 
 if __name__ == '__main__':

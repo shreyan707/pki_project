@@ -1266,7 +1266,7 @@ def build_presentation():
         "Thank you very much for your time and attention. I am now open to questions from the evaluation committee."
     )
 
-    out_path = "PKI_Trust_Management_Final_Presentation.pptx"
+    out_path = "deliverable_reports/PKI_Trust_Management_Final_Presentation.pptx"
     prs.save(out_path)
     print(f"Successfully generated {out_path} with {len(prs.slides)} slides.")
 

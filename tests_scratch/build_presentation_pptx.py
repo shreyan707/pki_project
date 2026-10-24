@@ -261,7 +261,7 @@ def build_presentation():
     )
 
     # Save initial slides to verify progress
-    prs.save("PKI_Trust_Management_Final_Presentation.pptx")
+    prs.save("deliverable_reports/PKI_Trust_Management_Final_Presentation.pptx")
     print("Base slides created. Continuing with all 15 slides...")
 
 build_presentation()
